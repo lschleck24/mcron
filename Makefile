@@ -1,5 +1,5 @@
 CFLAGS= -Wall -Wextra -Werror -ggdb
-LDFLAGS= -lrt
+LDFLAGS= #-lrt
 
 prog = mcron
 objects = mcron.o mu.o

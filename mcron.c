@@ -10,22 +10,32 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <stdlib.h>
+#include <time.h>
+
+void log_command_with_timestamp(const char *command);
 
 const char *pid_file = "mcron.pid";
 const char *log_file = "mcron.log";
 int log_rotation_count = 0;
+volatile sig_atomic_t signal_received = 0;
+int flag = 0;
+const char *config_file = "";
+int delay_seconds = 0;
 
 struct job {
     unsigned int interval; // Job interval in seconds
     char command[256];     // Command to run
     int job_id;           // Job ID
     struct job *next;      // Pointer to the next job in the list
+    time_t next_execution_time;
 };
 
 struct job *job_list = NULL;  // Head of the job list
 int job_count = 0; 
 
 // Parse a configuration line into a job struct
+/*
 struct job *job_from_config_line(const char *line) {
     struct job *new_job = malloc(sizeof(struct job));
     if (new_job == NULL) {
@@ -42,13 +52,32 @@ struct job *job_from_config_line(const char *line) {
     new_job->job_id = job_count++; // Assign job ID based on current job count
     new_job->next = NULL;          // Initialize next pointer
     return new_job;
+}*/
+
+struct job *job_from_config_line(const char *line) {
+    struct job *new_job = malloc(sizeof(struct job));
+    if (new_job == NULL) {
+        perror("Failed to allocate memory for new job");
+        return NULL;
+    }
+
+    if (sscanf(line, "%u %255[^\n]", &new_job->interval, new_job->command) != 2) {
+        fprintf(stderr, "Invalid config line: %s\n", line);
+        free(new_job);
+        return NULL;
+    }
+
+    new_job->job_id = job_count++;
+    new_job->next_execution_time = time(NULL) + new_job->interval;
+    new_job->next = NULL;
+    return new_job;
 }
 
 void read_config_file(const char *config_file) {
     FILE *file = fopen(config_file, "r");
     if (!file) {
-        perror("Failed to open config file");
-        return;
+        perror("Failed to open config file ah ah");
+        exit(1);
     }
 
     char line[256];
@@ -66,6 +95,10 @@ void read_config_file(const char *config_file) {
 
 void handle_sigterm_or_sigint(int sig) {
     (void)sig;
+    printf("This happens\n");
+    signal_received=1;
+    flag = 1;
+    printf("flag is 1\n");
     // Delete the PID file
     if (remove(pid_file) == 0) {
         printf("PID file deleted successfully.\n");
@@ -98,15 +131,27 @@ void handle_sigusr1(int sig) {
     }
 }
 
+void clear_job_list() {
+    while (job_list) {
+        struct job *temp = job_list;
+        job_list = job_list->next;
+        free(temp);
+    }
+    job_count = 0; // Reset job count
+}
+
 void handle_sighup(int sig) {
     (void)sig;
     printf("Received SIGHUP: Clearing job list and re-reading configuration file.\n");
+
+    clear_job_list();
+    read_config_file(config_file);
     // Simulated re-reading of config file
     // read_config_file("a.conf"); // Uncomment and implement this if you have a config file to read
 }
 
 void setup_signal_handlers() {
-    struct sigaction sa;
+    struct sigaction sa,sa_usr1, sa_up;
 
     // Handle SIGTERM and SIGINT
     sa.sa_handler = handle_sigterm_or_sigint;
@@ -116,12 +161,34 @@ void setup_signal_handlers() {
     sigaction(SIGINT, &sa, NULL);
 
     // Handle SIGUSR1 for log rotation
-    sa.sa_handler = handle_sigusr1;
-    sigaction(SIGUSR1, &sa, NULL);
+    sa_usr1.sa_handler = handle_sigusr1;
+    sigaction(SIGUSR1, &sa_usr1, NULL);
 
     // Handle SIGHUP for re-reading config and clearing jobs
-    sa.sa_handler = handle_sighup;
-    sigaction(SIGHUP, &sa, NULL);
+    sa_up.sa_handler = handle_sighup;
+    sigaction(SIGHUP, &sa_up, NULL);
+
+    // Set up SIGTERM handler
+    if (sigaction(SIGTERM, &sa, NULL) == -1) {
+        perror("Error setting up SIGTERM handler");
+        exit(EXIT_FAILURE);
+    }
+
+    // Set up SIGINT handler
+    if (sigaction(SIGINT, &sa, NULL) == -1) {
+        perror("Error setting up SIGINT handler");
+        exit(EXIT_FAILURE);
+    }
+
+    // Create the PID file (ensure this is done correctly)
+    FILE *pid_fp = fopen(pid_file, "w");
+    if (pid_fp) {
+        fprintf(pid_fp, "%d\n", getpid()); // Write the current PID to the file
+        fclose(pid_fp);
+    } else {
+        perror("Failed to create PID file");
+        exit(EXIT_FAILURE);
+    }
 }
 
 void write_pid_file() {
@@ -154,6 +221,27 @@ void read_config_file(const char *config_file) {
     fclose(file);
 }
 */
+void log_command_execution(const char *command) {
+    FILE *log_fp = fopen(log_file, "a"); // Open log file in append mode
+    if (log_fp) {
+        // Get the current time
+        time_t now = time(NULL);
+        struct tm *tm_info = gmtime(&now);
+        
+        // Format the time
+        char time_str[64];
+        strftime(time_str, sizeof(time_str), "%Y/%m/%d %H:%M:%S UTC", tm_info);
+
+        // Write the log entry
+        printf("%s, %s \n", time_str,command);
+        fprintf(log_fp, "%s 0 %s\n", time_str, command);
+        fclose(log_fp);
+    } else {
+        perror("Failed to open log file");
+    }
+}
+
+
 FILE *open_log_file(const char *log_file) {
     FILE *log_fp = fopen(log_file, "w");  // "w" ensures truncation and overwrite
     if (!log_fp) {
@@ -177,10 +265,11 @@ main(int argc,char *argv[])
      * functions as needed.
      */
     int opt;
-    const char *short_opts = "hl:";
+    const char *short_opts = "hl:d:";
     struct option long_opts[] = {
         {"help", no_argument, NULL, 'h'},
         {"log-file", required_argument, NULL, 'l'},
+        {"delay",required_argument,NULL,'d'}
     };
 
      while((opt = getopt_long(argc, argv, short_opts,long_opts,NULL))!=-1){
@@ -191,6 +280,14 @@ main(int argc,char *argv[])
         switch(opt){
             case 'l':{
                 log_file = optarg;
+                break;
+            }
+            case 'd':{
+                delay_seconds = atoi(optarg);
+                if(delay_seconds<0){
+                    fprintf(stderr,"Invalid Delay Value\n");
+                    return 1;
+                }
                 break;
             }
             default:
@@ -209,26 +306,80 @@ main(int argc,char *argv[])
             exit(EXIT_FAILURE);
         }
     }
+    write_pid_file();
+    config_file = argv[optind];
     FILE *log_fp = open_log_file(log_file);
-    fclose(log_fp);
+    setup_signal_handlers();
 
+    read_config_file(config_file);
+    /*
     while (1) {
-            struct job *current = job_list;
+    if(signal_received==1){
+        break;
+    }
+    
+    struct job *current = job_list;
+
+    if (current == NULL) {
+        printf("No jobs to process. Waiting...\n");
+        sleep(1); // Sleep to avoid busy-waiting
+        printf("%s\n",current->command);
+        continue; // Recheck the job list
+    }
     while (current) {
         sleep(current->interval); // Wait for the job's interval
         // Log the command output
         FILE *log_fp = fopen(log_file, "a"); // Open log file in append mode
         if (log_fp) {
-            fprintf(log_fp, "%s\n", current->command); // Log the command
-            fclose(log_fp);
+            //fprintf(log_fp, "%s\n", current->command); // Log the command
+            log_command_execution(current->command);
+            //fclose(log_fp);
         }
 
         // Here, you can execute the command if needed
         // system(current->command); // Uncomment to actually run the command
         current = current->next; // Move to the next job
     }
+    }*/
+    if (delay_seconds > 0) {
+        printf("Delaying start by %d seconds...\n", delay_seconds);
+        sleep(delay_seconds);
     }
 
+   while (1) {
+        if (flag == 1) {
+            printf("HELLLO SIRR\n");
+            break;
+        }
+
+        time_t now = time(NULL);
+        struct job *current = job_list;
+
+        while (current) {
+            if (flag == 1) {
+            printf("HELLLO SIRR\n");
+            break;
+            }
+            if (current->next_execution_time <= now) {
+                log_command_execution(current->command);
+                // system(current->command); // Uncomment to actually run the command
+
+                // Schedule the next execution time
+                current->next_execution_time = now + current->interval;
+            }
+            current = current->next;
+            printf("hello\n");
+        }
+
+        usleep(500000); // Sleep for half a second to avoid busy-waiting
+    }
+
+    while (job_list) {
+        struct job *temp = job_list;
+        job_list = job_list->next;
+        free(temp);
+    }
+    fclose(log_fp);
 
     return 0;
 }
